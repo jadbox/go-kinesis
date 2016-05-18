@@ -2,29 +2,28 @@
 package kinesis
 
 import (
-	"errors"
+	"log"
 	"time"
 
-	"github.com/apex/log"
-	k "github.com/aws/aws-sdk-go/service/kinesis"
-	"github.com/aws/aws-sdk-go/service/kinesis/kinesisiface"
+	fh "github.com/aws/aws-sdk-go/service/firehose"
+	"github.com/aws/aws-sdk-go/service/firehose/firehoseiface"
 	"github.com/jpillora/backoff"
 )
 
 // Size limits as defined by http://docs.aws.amazon.com/kinesis/latest/APIReference/API_PutRecords.html.
-const (
-	maxRecordSize        = 1 << 20 // 1MiB
-	maxRequestSize       = 5 << 20 // 5MiB
-	maxRecordsPerRequest = 500
-)
+// const (
+// 	maxRecordSize        = 1 << 20 // 1MiB
+// 	maxRequestSize       = 5 << 20 // 5MiB
+// 	maxRecordsPerRequest = 500
+// )
 
 // Errors.
 var (
-	ErrRecordSizeExceeded = errors.New("kinesis: record size exceeded")
+// ErrRecordSizeExceeded = errors.New("firehose: record size exceeded")
 )
 
-type Config struct {
-	// StreamName is the Kinesis stream.
+type FirehoseConfig struct {
+	// StreamName is the Firehose stream.
 	StreamName string
 
 	// FlushInterval is a regular interval for flushing the buffer. Defaults to 1s.
@@ -39,23 +38,12 @@ type Config struct {
 	// Backoff determines the backoff strategy for record failures.
 	Backoff backoff.Backoff
 
-	// Logger is the logger used. Defaults to log.Log.
-	Logger log.Interface
-
-	// Client is the Kinesis API implementation.
-	Client kinesisiface.KinesisAPI
+	// Client is the Firehose API implementation.
+	Client firehoseiface.FirehoseAPI
 }
 
 // defaults for configuration.
-func (c *Config) defaults() {
-	if c.Logger == nil {
-		c.Logger = log.Log
-	}
-
-	c.Logger = c.Logger.WithFields(log.Fields{
-		"package": "kinesis",
-		"stream":  c.StreamName,
-	})
+func (c *FirehoseConfig) defaults() {
 
 	if c.BufferSize == 0 {
 		c.BufferSize = maxRecordsPerRequest
@@ -74,45 +62,44 @@ func (c *Config) defaults() {
 	}
 }
 
-// Producer batches records.
-type KinesisProducer struct {
-	Config
-	records chan *k.PutRecordsRequestEntry
+// FirehoseProducer batches records.
+type FirehoseProducer struct {
+	FirehoseConfig
+	records chan *fh.Record
 	done    chan struct{}
 }
 
-// New producer with the given config.
-func New(config Config) *KinesisProducer {
+// NewFirehose producer with the given config.
+func NewFirehose(config FirehoseConfig) *FirehoseProducer {
 	config.defaults()
-	return &KinesisProducer{
-		Config:  config,
-		records: make(chan *k.PutRecordsRequestEntry, config.BacklogSize),
-		done:    make(chan struct{}),
+	return &FirehoseProducer{
+		FirehoseConfig: config,
+		records:        make(chan *fh.Record, config.BacklogSize),
+		done:           make(chan struct{}),
 	}
 }
 
-// Put record `data` using `partitionKey`. This method is thread-safe.
-func (p *KinesisProducer) Put(data []byte, partitionKey string) error {
+// Put record `data`. This method is thread-safe.
+func (p *FirehoseProducer) Put(data []byte) error {
 	if len(data) > maxRecordSize {
 		return ErrRecordSizeExceeded
 	}
 
-	p.records <- &k.PutRecordsRequestEntry{
-		Data:         data,
-		PartitionKey: &partitionKey,
+	p.records <- &fh.Record{
+		Data: data,
 	}
 
 	return nil
 }
 
 // Start the producer.
-func (p *KinesisProducer) Start() {
+func (p *FirehoseProducer) Start() {
 	go p.loop()
 }
 
 // Stop the producer. Flushes any in-flight data.
-func (p *KinesisProducer) Stop() {
-	p.Logger.WithField("backlog", len(p.records)).Info("stopping producer")
+func (p *FirehoseProducer) Stop() {
+	log.Println("backlog", len(p.records), "stopping producer")
 
 	// drain
 	p.done <- struct{}{}
@@ -121,12 +108,12 @@ func (p *KinesisProducer) Stop() {
 	// wait
 	<-p.done
 
-	p.Logger.Info("stopped producer")
+	log.Println("stopped producer")
 }
 
 // loop and flush at the configured interval, or when the buffer is exceeded.
-func (p *KinesisProducer) loop() {
-	buf := make([]*k.PutRecordsRequestEntry, 0, p.BufferSize)
+func (p *FirehoseProducer) loop() {
+	buf := make([]*fh.Record, 0, p.BufferSize)
 	tick := time.NewTicker(p.FlushInterval)
 	drain := false
 
@@ -144,10 +131,11 @@ func (p *KinesisProducer) loop() {
 			}
 
 			if drain && len(p.records) == 0 {
-				p.Logger.Info("drained")
+				log.Println("drained")
 				return
 			}
 		case <-tick.C:
+			go log.Println("backlog:", len(p.records))
 			if len(buf) > 0 {
 				p.flush(buf, "interval")
 				buf = nil
@@ -163,44 +151,44 @@ func (p *KinesisProducer) loop() {
 }
 
 // flush records and retry failures if necessary.
-func (p *KinesisProducer) flush(records []*k.PutRecordsRequestEntry, reason string) {
-	p.Logger.WithFields(log.Fields{
-		"records": len(records),
-		"reason":  reason,
-	}).Info("flush")
+func (p *FirehoseProducer) flush(records []*fh.Record, reason string) {
+	go log.Println("flush:",
+		"records:", len(records),
+		"reason:", reason,
+	)
 
-	out, err := p.Client.PutRecords(&k.PutRecordsInput{
-		StreamName: &p.StreamName,
-		Records:    records,
+	out, err := p.Client.PutRecordBatch(&fh.PutRecordBatchInput{
+		DeliveryStreamName: &p.StreamName,
+		Records:            records,
 	})
 
 	if err != nil {
 		// TODO(tj): confirm that the AWS SDK handles retries of request-level errors
 		// otherwise we need to backoff here as well.
-		p.Logger.WithError(err).Error("flush")
+		log.Println("flush:", err)
 		p.Backoff.Reset()
 		return
 	}
 
-	failed := *out.FailedRecordCount
+	failed := *out.FailedPutCount
 	if failed == 0 {
 		return
 	}
 
 	backoff := p.Backoff.Duration()
 
-	p.Logger.WithFields(log.Fields{
-		"failures": failed,
-		"backoff":  backoff,
-	}).Warn("put failures")
+	go log.Println("put failures:",
+		"failures:", failed,
+		"backoff:", backoff,
+	)
 
 	time.Sleep(backoff)
 
-	p.flush(failures(records, out.Records), "retry")
+	p.flush(ffailures(records, out.RequestResponses), "retry")
 }
 
 // failures returns the failed records as indicated in the response.
-func failures(records []*k.PutRecordsRequestEntry, response []*k.PutRecordsResultEntry) (out []*k.PutRecordsRequestEntry) {
+func ffailures(records []*fh.Record, response []*fh.PutRecordBatchResponseEntry) (out []*fh.Record) {
 	for i, record := range response {
 		if record.ErrorCode != nil {
 			out = append(out, records[i])
