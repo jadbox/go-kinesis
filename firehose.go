@@ -123,6 +123,7 @@ func (p *FirehoseProducer) Stop() {
 // loop and flush at the configured interval, or when the buffer is exceeded.
 func (p *FirehoseProducer) loop() {
 	buf := make([]*fh.Record, 0, p.BufferSize)
+	parallelCalls := make(chan bool, 5)
 	bufBytes := 0
 	tick := time.NewTicker(p.FlushInterval)
 	drain := false
@@ -136,7 +137,8 @@ func (p *FirehoseProducer) loop() {
 			recordBytes := len(record.Data)
 			// Check if new record exeeds batch byte size, flush current buf if new entry exceeds size
 			if bufBytes + recordBytes >= maxRequestSize {
-				go p.flush(buf, "bufByteSize")
+				parallelCalls <- true
+				go p.flush(buf, "bufByteSize", parallelCalls)
 				buf = nil
 				bufBytes = 0
 			}
@@ -156,7 +158,8 @@ func (p *FirehoseProducer) loop() {
 			// If buf len is reached
 			if len(buf) >= p.BufferSize {
 				// Check if compatch is needed
-				go p.flush(buf, "bufferNumSize")
+				parallelCalls <- true
+				go p.flush(buf, "bufferNumSize", parallelCalls)
 				buf = nil
 				bufBytes = 0
 			}
@@ -168,7 +171,8 @@ func (p *FirehoseProducer) loop() {
 		case <-tick.C:
 			if len(buf) > 0 {
 				// go log.Println("backlog:", len(p.records))
-				go p.flush(buf, "interval")
+				parallelCalls <- true
+				go p.flush(buf, "interval", parallelCalls)
 				buf = nil
 				bufBytes = 0
 			}
@@ -183,7 +187,7 @@ func (p *FirehoseProducer) loop() {
 }
 
 // flush records and retry failures if necessary.
-func (p *FirehoseProducer) flush(records []*fh.Record, reason string) {
+func (p *FirehoseProducer) flush(records []*fh.Record, reason string, parallelCalls chan bool) {
 	go log.Println("flush:",
 		"records:", len(records),
 		"reason:", reason,
@@ -200,11 +204,13 @@ func (p *FirehoseProducer) flush(records []*fh.Record, reason string) {
 		// otherwise we need to backoff here as well.
 		log.Println("flush:", err)
 		p.Backoff.Reset()
+		<- parallelCalls
 		return
 	}
 
 	failed := *out.FailedPutCount
 	if failed == 0 {
+		<- parallelCalls
 		return
 	}
 
@@ -217,7 +223,7 @@ func (p *FirehoseProducer) flush(records []*fh.Record, reason string) {
 
 	time.Sleep(backoff)
 
-	p.flush(ffailures(records, out.RequestResponses), "retry")
+	p.flush(ffailures(records, out.RequestResponses), "retry", parallelCalls)
 }
 
 // failures returns the failed records as indicated in the response.
