@@ -135,8 +135,8 @@ func (p *FirehoseProducer) loop() {
 				return
 			}
 		case <-tick.C:
-			go log.Println("backlog:", len(p.records))
 			if len(buf) > 0 {
+				// go log.Println("backlog:", len(p.records))
 				p.flush(buf, "interval")
 				buf = nil
 			}
@@ -155,6 +155,7 @@ func (p *FirehoseProducer) flush(records []*fh.Record, reason string) {
 	go log.Println("flush:",
 		"records:", len(records),
 		"reason:", reason,
+		"backlog:", len(p.records),
 	)
 
 	out, err := p.Client.PutRecordBatch(&fh.PutRecordBatchInput{
