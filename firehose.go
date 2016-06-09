@@ -17,6 +17,12 @@ import (
 // 	maxRecordsPerRequest = 500
 // )
 
+// const (
+// 	maxRecordSize        = 1 << 20 // 1MiB
+// 	maxRequestSize       = 4 << 20 // 5MiB
+// 	maxRecordsPerRequest = 500
+// )
+
 // Errors.
 var (
 // ErrRecordSizeExceeded = errors.New("firehose: record size exceeded")
@@ -40,6 +46,9 @@ type FirehoseConfig struct {
 
 	// Client is the Firehose API implementation.
 	Client firehoseiface.FirehoseAPI
+
+	// Compact messages
+	Compact bool
 }
 
 // defaults for configuration.
@@ -114,6 +123,7 @@ func (p *FirehoseProducer) Stop() {
 // loop and flush at the configured interval, or when the buffer is exceeded.
 func (p *FirehoseProducer) loop() {
 	buf := make([]*fh.Record, 0, p.BufferSize)
+	bufBytes := 0
 	tick := time.NewTicker(p.FlushInterval)
 	drain := false
 
@@ -123,11 +133,32 @@ func (p *FirehoseProducer) loop() {
 	for {
 		select {
 		case record := <-p.records:
-			buf = append(buf, record)
-
-			if len(buf) >= p.BufferSize {
-				p.flush(buf, "buffer size")
+			recordBytes := len(record.Data)
+			// Check if new record exeeds batch byte size, flush current buf if new entry exceeds size
+			if bufBytes + recordBytes >= maxRequestSize {
+				go p.flush(buf, "bufByteSize")
 				buf = nil
+				bufBytes = 0
+			}
+
+			bufBytes += recordBytes
+
+			// Add it to batch
+			var lastEntry *fh.Record = nil
+			if len(buf) > 0 { lastEntry = buf[len(buf)-1] }
+			// Use Compact? Is there a last entry? Does adding this entry to the last be under the maxRecordSize?
+			if p.Compact == true && lastEntry != nil && len(lastEntry.Data) + recordBytes < maxRecordSize {
+				lastEntry.Data = append(lastEntry.Data, record.Data...)
+			} else {
+				buf = append(buf, record)
+			}
+
+			// If buf len is reached
+			if len(buf) >= p.BufferSize {
+				// Check if compatch is needed
+				go p.flush(buf, "bufferNumSize")
+				buf = nil
+				bufBytes = 0
 			}
 
 			if drain && len(p.records) == 0 {
@@ -137,8 +168,9 @@ func (p *FirehoseProducer) loop() {
 		case <-tick.C:
 			if len(buf) > 0 {
 				// go log.Println("backlog:", len(p.records))
-				p.flush(buf, "interval")
+				go p.flush(buf, "interval")
 				buf = nil
+				bufBytes = 0
 			}
 		case <-p.done:
 			drain = true

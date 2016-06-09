@@ -13,8 +13,8 @@ import (
 
 // Size limits as defined by http://docs.aws.amazon.com/kinesis/latest/APIReference/API_PutRecords.html.
 const (
-	maxRecordSize        = 1 << 20 // 1MiB
-	maxRequestSize       = 5 << 20 // 5MiB
+	maxRecordSize        = 1024000 // 1MiB, as Reported by AWS sdk
+	maxRequestSize       = maxRecordSize * 4 // 4MiB for kinesis
 	maxRecordsPerRequest = 500
 )
 
