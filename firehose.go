@@ -47,12 +47,18 @@ type FirehoseConfig struct {
 	// Client is the Firehose API implementation.
 	Client firehoseiface.FirehoseAPI
 
-	// Compact messages
+	// Compact messages in records
 	Compact bool
+
+	// Max concurrent calls to Firehose, default 1
+	ConcurrentRequests int
 }
 
 // defaults for configuration.
 func (c *FirehoseConfig) defaults() {
+	if c.ConcurrentRequests == 0 {
+		c.ConcurrentRequests = 1
+	}
 
 	if c.BufferSize == 0 {
 		c.BufferSize = maxRecordsPerRequest
@@ -123,7 +129,7 @@ func (p *FirehoseProducer) Stop() {
 // loop and flush at the configured interval, or when the buffer is exceeded.
 func (p *FirehoseProducer) loop() {
 	buf := make([]*fh.Record, 0, p.BufferSize)
-	parallelCalls := make(chan bool, 5)
+	semRequests := make(chan bool, p.ConcurrentRequests)
 	bufBytes := 0
 	tick := time.NewTicker(p.FlushInterval)
 	drain := false
@@ -137,8 +143,8 @@ func (p *FirehoseProducer) loop() {
 			recordBytes := len(record.Data)
 			// Check if new record exeeds batch byte size, flush current buf if new entry exceeds size
 			if bufBytes + recordBytes >= maxRequestSize {
-				parallelCalls <- true
-				go p.flush(buf, "bufByteSize", parallelCalls)
+				semRequests <- true
+				go p.flush(buf, "bufByteSize", semRequests)
 				buf = nil
 				bufBytes = 0
 			}
@@ -158,8 +164,8 @@ func (p *FirehoseProducer) loop() {
 			// If buf len is reached
 			if len(buf) >= p.BufferSize {
 				// Check if compatch is needed
-				parallelCalls <- true
-				go p.flush(buf, "bufferNumSize", parallelCalls)
+				semRequests <- true
+				go p.flush(buf, "bufferNumSize", semRequests)
 				buf = nil
 				bufBytes = 0
 			}
@@ -171,8 +177,8 @@ func (p *FirehoseProducer) loop() {
 		case <-tick.C:
 			if len(buf) > 0 {
 				// go log.Println("backlog:", len(p.records))
-				parallelCalls <- true
-				go p.flush(buf, "interval", parallelCalls)
+				semRequests <- true
+				go p.flush(buf, "interval", semRequests)
 				buf = nil
 				bufBytes = 0
 			}
@@ -187,7 +193,7 @@ func (p *FirehoseProducer) loop() {
 }
 
 // flush records and retry failures if necessary.
-func (p *FirehoseProducer) flush(records []*fh.Record, reason string, parallelCalls chan bool) {
+func (p *FirehoseProducer) flush(records []*fh.Record, reason string, semRequests chan bool) {
 	go log.Println("flush:",
 		"records:", len(records),
 		"reason:", reason,
@@ -204,13 +210,13 @@ func (p *FirehoseProducer) flush(records []*fh.Record, reason string, parallelCa
 		// otherwise we need to backoff here as well.
 		log.Println("flush:", err)
 		p.Backoff.Reset()
-		<- parallelCalls
+		<- semRequests
 		return
 	}
 
 	failed := *out.FailedPutCount
 	if failed == 0 {
-		<- parallelCalls
+		<- semRequests
 		return
 	}
 
@@ -223,7 +229,7 @@ func (p *FirehoseProducer) flush(records []*fh.Record, reason string, parallelCa
 
 	time.Sleep(backoff)
 
-	p.flush(ffailures(records, out.RequestResponses), "retry", parallelCalls)
+	p.flush(ffailures(records, out.RequestResponses), "retry", semRequests)
 }
 
 // failures returns the failed records as indicated in the response.
