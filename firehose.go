@@ -194,11 +194,14 @@ func (p *FirehoseProducer) loop() {
 
 // flush records and retry failures if necessary.
 func (p *FirehoseProducer) flush(records []*fh.Record, reason string, semRequests chan bool) {
-	go log.Println("flush:",
-		"records:", len(records),
-		"reason:", reason,
-		"backlog:", len(p.records),
-	)
+
+	if reason != "interval" {
+		go log.Println("flush:",
+			"records:", len(records),
+			"reason:", reason,
+			"backlog:", len(p.records),
+		)
+	}
 
 	out, err := p.Client.PutRecordBatch(&fh.PutRecordBatchInput{
 		DeliveryStreamName: &p.StreamName,
